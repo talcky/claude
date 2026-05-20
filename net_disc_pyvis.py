@@ -436,22 +436,97 @@ def export_csv(neighbors: list[Neighbor], path: str) -> None:
 # ---------------------------------------------------------------------------
 # pyvis visualisation
 # ---------------------------------------------------------------------------
-def _node_style(hostname: str) -> dict:
-    """Return pyvis node attributes based on device role."""
+
+# Group definitions — each maps to a hierarchy level and visual style.
+# Level 0 = top of diagram, higher numbers = further down.
+DEVICE_GROUPS = [
+    {
+        "name":      "firewall",
+        "level":     0,
+        "prefixes":  ("fw", "asa", "palo", "ftd", "firewall"),
+        "color":     {"border": "#6c3483", "background": "#8e44ad",
+                      "highlight": {"border": "#a569bd", "background": "#a569bd"},
+                      "hover":     {"border": "#a569bd", "background": "#a569bd"}},
+        "shape":     "diamond",
+        "size":      32,
+        "borderWidth": 3,
+    },
+    {
+        "name":      "core",
+        "level":     1,
+        "prefixes":  ("core",),
+        "color":     {"border": "#a93226", "background": "#e74c3c",
+                      "highlight": {"border": "#ff6b6b", "background": "#ff6b6b"},
+                      "hover":     {"border": "#ff6b6b", "background": "#ff6b6b"}},
+        "shape":     "box",
+        "size":      36,
+        "borderWidth": 3,
+    },
+    {
+        "name":      "router",
+        "level":     1,
+        "prefixes":  ("rtr", "router", "gw", "gateway"),
+        "color":     {"border": "#b7770d", "background": "#f39c12",
+                      "highlight": {"border": "#f8c471", "background": "#f8c471"},
+                      "hover":     {"border": "#f8c471", "background": "#f8c471"}},
+        "shape":     "box",
+        "size":      30,
+        "borderWidth": 2,
+    },
+    {
+        "name":      "distribution",
+        "level":     2,
+        "prefixes":  ("dist", "agg", "aggr"),
+        "color":     {"border": "#b7770d", "background": "#e67e22",
+                      "highlight": {"border": "#f0a500", "background": "#f0a500"},
+                      "hover":     {"border": "#f0a500", "background": "#f0a500"}},
+        "shape":     "box",
+        "size":      26,
+        "borderWidth": 2,
+    },
+    {
+        "name":      "access",
+        "level":     3,
+        "prefixes":  ("access", "acc", "sw", "switch"),
+        "color":     {"border": "#1a6fa8", "background": "#3498db",
+                      "highlight": {"border": "#5dade2", "background": "#5dade2"},
+                      "hover":     {"border": "#5dade2", "background": "#5dade2"}},
+        "shape":     "box",
+        "size":      20,
+        "borderWidth": 2,
+    },
+    {
+        "name":      "ap",
+        "level":     4,
+        "prefixes":  ("ap", "wap", "air", "wifi"),
+        "color":     {"border": "#1e8449", "background": "#27ae60",
+                      "highlight": {"border": "#58d68d", "background": "#58d68d"},
+                      "hover":     {"border": "#58d68d", "background": "#58d68d"}},
+        "shape":     "dot",
+        "size":      16,
+        "borderWidth": 2,
+    },
+]
+
+# Fallback for unrecognised devices
+_FALLBACK_GROUP = {
+    "name":      "unknown",
+    "level":     3,
+    "color":     {"border": "#616a6b", "background": "#7f8c8d",
+                  "highlight": {"border": "#aab7b8", "background": "#aab7b8"},
+                  "hover":     {"border": "#aab7b8", "background": "#aab7b8"}},
+    "shape":     "ellipse",
+    "size":      20,
+    "borderWidth": 2,
+}
+
+
+def _get_group(hostname: str) -> dict:
     h = hostname.lower()
-    if h.startswith("core"):
-        return {"color": "#e74c3c", "size": 40, "shape": "box",     "borderWidth": 3}
-    if h.startswith("dist"):
-        return {"color": "#e67e22", "size": 30, "shape": "box",     "borderWidth": 2}
-    if h.startswith("access") or h.startswith("acc"):
-        return {"color": "#3498db", "size": 22, "shape": "box",     "borderWidth": 2}
-    if any(h.startswith(p) for p in ("fw", "asa", "palo", "ftd")):
-        return {"color": "#8e44ad", "size": 28, "shape": "diamond", "borderWidth": 2}
-    if any(h.startswith(p) for p in ("ap", "wap", "air")):
-        return {"color": "#27ae60", "size": 18, "shape": "dot",     "borderWidth": 2}
-    if any(h.startswith(p) for p in ("rtr", "router", "r")):
-        return {"color": "#c0392b", "size": 25, "shape": "ellipse", "borderWidth": 2}
-    return {"color": "#7f8c8d",     "size": 20, "shape": "ellipse", "borderWidth": 2}
+    for g in DEVICE_GROUPS:
+        if any(h.startswith(p) for p in g["prefixes"]):
+            return g
+    return _FALLBACK_GROUP
 
 
 def generate_pyvis(
@@ -459,7 +534,14 @@ def generate_pyvis(
     output_file: str = "topology.html",
     auto_open: bool = True,
 ) -> None:
-    """Build an interactive pyvis topology diagram and save to HTML."""
+    """
+    Build an interactive pyvis topology diagram with:
+    - Hierarchical top-down layout (firewall → core → dist → access → APs)
+    - Group-based colour coding and node shapes
+    - Per-node hover tooltips (IP, platform, connections)
+    - Styled edges with interface-pair labels
+    - Physics and layout control panel in the browser
+    """
     if not HAS_PYVIS:
         log.warning("pyvis not available — skipping HTML diagram.")
         return
@@ -473,41 +555,118 @@ def generate_pyvis(
         notebook=False,
     )
 
-    net.force_atlas_2based(
-        gravity=-50,
-        central_gravity=0.01,
-        spring_length=160,
-        spring_strength=0.08,
-        damping=0.4,
-        overlap=0,
-    )
+    # Hierarchical layout options — passed as raw JSON to vis.js
+    net.set_options("""
+    {
+      "layout": {
+        "hierarchical": {
+          "enabled": true,
+          "direction": "UD",
+          "sortMethod": "directed",
+          "levelSeparation": 160,
+          "nodeSpacing": 140,
+          "treeSpacing": 200,
+          "blockShifting": true,
+          "edgeMinimization": true,
+          "parentCentralization": true
+        }
+      },
+      "physics": {
+        "enabled": true,
+        "hierarchicalRepulsion": {
+          "nodeDistance": 160,
+          "springLength": 120,
+          "springConstant": 0.01,
+          "damping": 0.09,
+          "avoidOverlap": 1
+        },
+        "solver": "hierarchicalRepulsion",
+        "stabilization": {
+          "enabled": true,
+          "iterations": 200
+        }
+      },
+      "edges": {
+        "smooth": {
+          "type": "cubicBezier",
+          "forceDirection": "vertical",
+          "roundness": 0.4
+        },
+        "font": {
+          "size": 9,
+          "color": "#7fb3d3",
+          "align": "middle",
+          "strokeWidth": 0
+        },
+        "color": {
+          "color": "#4a90d9",
+          "highlight": "#ffffff",
+          "hover": "#aad4f5"
+        },
+        "width": 2,
+        "selectionWidth": 3
+      },
+      "nodes": {
+        "font": {
+          "size": 12,
+          "color": "#ecf0f1",
+          "face": "monospace"
+        },
+        "shadow": {
+          "enabled": true,
+          "color": "rgba(0,0,0,0.5)",
+          "size": 8,
+          "x": 3,
+          "y": 3
+        }
+      },
+      "interaction": {
+        "hover": true,
+        "tooltipDelay": 100,
+        "navigationButtons": true,
+        "keyboard": true
+      }
+    }
+    """)
+
+    # Collect metadata for tooltips — track connections per device too
+    node_meta:  dict[str, dict] = {}
+    node_conns: dict[str, list] = {}
+    for n in neighbors:
+        node_meta.setdefault(n.local_device,   {"ip": "",          "platform": ""})
+        node_meta.setdefault(n.neighbor_device, {"ip": n.neighbor_ip, "platform": n.platform})
+        node_conns.setdefault(n.local_device,   []).append(f"{n.local_interface} → {n.neighbor_device}")
+        node_conns.setdefault(n.neighbor_device,[]).append(f"{n.neighbor_interface} → {n.local_device}")
 
     added: set[str] = set()
 
-    # Track per-node metadata for richer tooltips
-    node_meta: dict[str, dict] = {}
     for n in neighbors:
-        node_meta.setdefault(n.neighbor_device, {
-            "ip": n.neighbor_ip, "platform": n.platform
-        })
+        for device in (n.local_device, n.neighbor_device):
+            if device in added:
+                continue
 
-    for n in neighbors:
-        for device, is_neighbor in ((n.local_device, False), (n.neighbor_device, True)):
-            if device not in added:
-                style = _node_style(device)
-                meta  = node_meta.get(device, {})
-                tip   = (
-                    f"<b>{device}</b><br>"
-                    f"IP: {meta.get('ip') or '—'}<br>"
-                    f"Platform: {meta.get('platform') or '—'}"
-                )
-                net.add_node(
-                    device,
-                    label=device,
-                    title=tip,
-                    **style,
-                )
-                added.add(device)
+            group  = _get_group(device)
+            meta   = node_meta.get(device, {})
+            conns  = node_conns.get(device, [])
+            conn_html = "".join(f"<br>&nbsp;&nbsp;• {c}" for c in conns)
+            tip = (
+                f"<b>{device}</b><br>"
+                f"IP: {meta.get('ip') or '—'}<br>"
+                f"Platform: {meta.get('platform') or '—'}<br>"
+                f"Links ({len(conns)}):{conn_html}"
+            )
+
+            net.add_node(
+                device,
+                label=device,
+                title=tip,
+                level=group["level"],
+                color=group["color"],
+                shape=group["shape"],
+                size=group["size"],
+                borderWidth=group["borderWidth"],
+            )
+            added.add(device)
 
         edge_label = f"{n.local_interface} ↔ {n.neighbor_interface}"
         net.add_edge(
@@ -515,12 +674,9 @@ def generate_pyvis(
             n.neighbor_device,
             label=edge_label,
             title=f"{n.protocol}: {edge_label}",
-            color="#4a90d9",
-            width=2,
         )
 
-    # Show physics tuning panel in the browser
-    net.show_buttons(filter_=["physics"])
+    net.show_buttons(filter_=["layout", "physics"])
     net.write_html(output_file)
 
     log.info("Topology diagram saved → %s", output_file)
