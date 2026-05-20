@@ -373,19 +373,43 @@ def deduplicate(neighbors: list[Neighbor]) -> list[Neighbor]:
 # Output helpers
 # ---------------------------------------------------------------------------
 def print_table(neighbors: list[Neighbor]) -> None:
-    headers = ["Local Device", "Local Intf", "Neighbor", "Neighbor IP",
-               "Neighbor Intf", "Platform", "Protocol"]
+    headers = [
+        "#",
+        "Local Device",
+        "Local Intf",
+        "Neighbor Device",
+        "Neighbor IP",
+        "Neighbor Intf",
+        "Platform",
+        "Capabilities",
+        "Proto",
+    ]
     rows = [
-        [n.local_device, n.local_interface, n.neighbor_device,
-         n.neighbor_ip, n.neighbor_interface, n.platform[:30], n.protocol]
-        for n in neighbors
+        [
+            i + 1,
+            n.local_device,
+            n.local_interface,
+            n.neighbor_device,
+            n.neighbor_ip or "—",
+            n.neighbor_interface,
+            n.platform[:35] or "—",
+            n.capabilities[:25] or "—",
+            n.protocol,
+        ]
+        for i, n in enumerate(neighbors)
     ]
     if HAS_TABULATE:
-        print(tabulate(rows, headers=headers, tablefmt="rounded_outline"))
+        print(tabulate(rows, headers=headers, tablefmt="rounded_outline",
+                       colalign=("right",) + ("left",) * (len(headers) - 1)))
     else:
-        print("  ".join(headers))
+        widths = [max(len(str(r[c])) for r in ([headers] + rows)) for c in range(len(headers))]
+        sep = "  ".join("-" * w for w in widths)
+        fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+        print(fmt.format(*headers))
+        print(sep)
         for row in rows:
-            print("  ".join(str(c) for c in row))
+            print(fmt.format(*row))
+    print(f"\n  {len(neighbors)} link(s) found.\n")
 
 
 def export_csv(neighbors: list[Neighbor], path: str) -> None:
@@ -454,78 +478,68 @@ def discover(
     device_type: str = "auto",
     use_cdp: bool = True,
     use_lldp: bool = False,
+    max_depth: int = 1,
     csv_path: Optional[str] = None,
 ) -> list[Neighbor]:
     """
-    Two-phase discovery:
+    BFS discovery up to max_depth hops from the seed devices.
 
-    Phase 1 — Seeds:
-        Poll every seed host and collect their direct CDP/LLDP neighbors.
+    Depth 0 — seeds only (no recursion into neighbors)
+    Depth 1 — seeds + their direct neighbors          (default)
+    Depth N — seeds + N hops outward
 
-    Phase 2 — One hop out:
-        For each neighbor discovered in phase 1, connect to that device
-        and run the same CDP/LLDP commands to reveal what is connected
-        beyond the seed's immediate view.
-
-    Discovery stops after this second hop. Devices already polled in
-    phase 1 are skipped in phase 2 to avoid redundant connections.
+    Each device is polled at most once. Connections use the IP address
+    advertised in CDP/LLDP output, falling back to the device hostname.
     """
     all_neighbors: list[Neighbor] = []
-    type_cache: dict[str, str] = {}
+    type_cache:    dict[str, str] = {}
+    polled:        set[str]       = set()   # hostnames already queried
+    # {device_name: connect_address} — populated as neighbors are discovered
+    ip_map:        dict[str, str] = {}
 
-    # ------------------------------------------------------------------
-    # Phase 1: seed devices
-    # ------------------------------------------------------------------
-    log.info("=== Phase 1: polling %d seed device(s) ===", len(seed_hosts))
-    polled: set[str] = set()          # tracks hostnames already queried
-    # Maps neighbor hostname -> IP address for phase 2 SSH connections
-    neighbor_ip_map: dict[str, str] = {}
+    # Seed the BFS queue as depth-0 entries
+    # Each queue entry: (connect_address, device_name, current_depth)
+    queue: list[tuple[str, str, int]] = [
+        (h, h, 0) for h in seed_hosts
+    ]
 
-    for host in seed_hosts:
-        hostname, neighbors = poll_device(
-            host, username, password, secret,
-            device_type, type_cache, use_cdp, use_lldp,
+    while queue:
+        connect_addr, device_name, depth = queue.pop(0)
+
+        # Skip if we've already polled this device
+        if device_name in polled or connect_addr in polled:
+            continue
+
+        log.info(
+            "=== Depth %d — polling %s (via %s) ===",
+            depth, device_name, connect_addr,
         )
-        if hostname is None:
-            continue
-        polled.add(hostname)
-        all_neighbors.extend(neighbors)
 
-        # Record IP addresses so phase 2 can SSH by IP, not hostname
-        for n in neighbors:
-            if n.neighbor_device not in polled:
-                if n.neighbor_ip:
-                    neighbor_ip_map[n.neighbor_device] = n.neighbor_ip
-                elif n.neighbor_device not in neighbor_ip_map:
-                    # No IP in CDP output — fall back to device name and hope DNS resolves it
-                    neighbor_ip_map[n.neighbor_device] = n.neighbor_device
-                    log.warning(
-                        "  No IP found for %s — will attempt connection by hostname",
-                        n.neighbor_device,
-                    )
-
-    # ------------------------------------------------------------------
-    # Phase 2: devices directly connected to the seeds
-    # ------------------------------------------------------------------
-    log.info(
-        "=== Phase 2: polling %d neighbor device(s) discovered from seeds ===",
-        len(neighbor_ip_map),
-    )
-    for device_name, connect_addr in neighbor_ip_map.items():
-        if device_name in polled:
-            log.info("  Skipping %s (already polled in phase 1)", device_name)
-            continue
-
-        log.info("  Connecting to %s via %s", device_name, connect_addr)
         hostname, neighbors = poll_device(
             connect_addr, username, password, secret,
             device_type, type_cache, use_cdp, use_lldp,
         )
         if hostname is None:
             continue
+
         polled.add(hostname)
-        polled.add(device_name)   # guard against hostname/IP mismatch causing a re-poll
+        polled.add(device_name)
+        polled.add(connect_addr)
         all_neighbors.extend(neighbors)
+
+        # Enqueue neighbors for the next depth level (if within limit)
+        if depth < max_depth:
+            for n in neighbors:
+                if n.neighbor_device in polled:
+                    continue
+                # Resolve the best address to connect to
+                addr = n.neighbor_ip or n.neighbor_device
+                if not n.neighbor_ip:
+                    log.warning(
+                        "  No IP for %s — will try by hostname", n.neighbor_device
+                    )
+                ip_map[n.neighbor_device] = addr
+                queue.append((addr, n.neighbor_device, depth + 1))
 
     # ------------------------------------------------------------------
     # Output
@@ -556,7 +570,10 @@ def parse_args():
     p.add_argument("--cdp",  action="store_true", default=True,  help="Use CDP (default: on)")
     p.add_argument("--lldp", action="store_true", default=False, help="Use LLDP (default: off)")
     p.add_argument("--no-cdp", dest="cdp",  action="store_false")
-    p.add_argument("--csv", metavar="FILE", help="Export results to CSV")
+    p.add_argument("--depth", "-d", type=int, default=None,
+                   help="Recursion depth (0=seeds only, 1=+neighbors, etc). Prompted if omitted.")
+    p.add_argument("--csv", metavar="FILE", default=None,
+                   help="Export results to CSV. Prompted if omitted.")
     return p.parse_args()
 
 
@@ -566,6 +583,23 @@ if __name__ == "__main__":
     password = getpass.getpass(f"SSH password for {args.username}: ")
     secret = args.secret or getpass.getpass("Enable secret (press Enter to use same as password): ") or password
 
+    # Recursion depth
+    if args.depth is not None:
+        max_depth = args.depth
+    else:
+        raw = input("Recursion depth — how many hops to follow? [1]: ").strip()
+        try:
+            max_depth = int(raw) if raw else 1
+        except ValueError:
+            print("Invalid input, defaulting to 1.")
+            max_depth = 1
+
+    # CSV export
+    csv_path = args.csv
+    if csv_path is None:
+        raw = input("Export results to CSV? Enter filename or press Enter to skip: ").strip()
+        csv_path = raw or None
+
     discover(
         seed_hosts=args.hosts,
         username=args.username,
@@ -574,5 +608,6 @@ if __name__ == "__main__":
         device_type=args.type,
         use_cdp=args.cdp,
         use_lldp=args.lldp,
-        csv_path=args.csv,
+        max_depth=max_depth,
+        csv_path=csv_path,
     )
