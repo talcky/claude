@@ -391,33 +391,47 @@ def export_csv(neighbors: list[Neighbor], path: str) -> None:
     log.info("CSV exported → %s", path)
 
 
-def generate_mermaid(neighbors: list[Neighbor]) -> str:
+
+# ---------------------------------------------------------------------------
+# Core: poll a single host, return (resolved_hostname, neighbors)
+# ---------------------------------------------------------------------------
+def poll_device(
+    host: str,
+    username: str,
+    password: str,
+    secret: str,
+    device_type: str,
+    type_cache: dict,
+    use_cdp: bool,
+    use_lldp: bool,
+) -> tuple[Optional[str], list[Neighbor]]:
     """
-    Build a Mermaid graph LR diagram from the neighbor list.
-    Each link is labelled with the interface pair.
+    Connect to one host, run CDP/LLDP, and return its hostname plus
+    the neighbors found. Returns (None, []) if the connection fails.
     """
-    lines = ["graph LR"]
-    node_ids: dict[str, str] = {}
+    if device_type == "auto":
+        if host not in type_cache:
+            type_cache[host] = autodetect_device_type(host, username, password, secret)
+        resolved_type = type_cache[host]
+    else:
+        resolved_type = device_type
 
-    def node_id(name: str) -> str:
-        if name not in node_ids:
-            safe = re.sub(r"[^A-Za-z0-9]", "_", name)
-            node_ids[name] = f"{safe}[{name}]"
-        return node_ids[name]
+    device = build_device(host, username, password, secret, resolved_type)
+    conn = connect(device)
+    if conn is None:
+        return None, []
 
-    for n in neighbors:
-        src = node_id(n.local_device)
-        dst = node_id(n.neighbor_device)
-        label = f"{n.local_interface} — {n.neighbor_interface}"
-        lines.append(f'    {src} -- "{label}" --> {dst}')
+    hostname = get_hostname(conn)
+    log.info("Polled: %s  (type: %s)", hostname, resolved_type)
 
-    return "\n".join(lines)
+    neighbors: list[Neighbor] = []
+    if use_cdp:
+        neighbors.extend(get_cdp_neighbors(conn, hostname))
+    if use_lldp:
+        neighbors.extend(get_lldp_neighbors(conn, hostname))
 
-
-def save_mermaid(diagram: str, path: str) -> None:
-    with open(path, "w") as f:
-        f.write(diagram)
-    log.info("Mermaid diagram saved → %s", path)
+    conn.disconnect()
+    return hostname, neighbors
 
 
 # ---------------------------------------------------------------------------
@@ -428,78 +442,81 @@ def discover(
     username: str,
     password: str,
     secret: str = "",
-    device_type: str = "auto",          # "auto" triggers per-host detection
+    device_type: str = "auto",
     use_cdp: bool = True,
     use_lldp: bool = False,
     csv_path: Optional[str] = None,
-    mermaid_path: Optional[str] = None,
-    recursive: bool = False,
 ) -> list[Neighbor]:
     """
-    Connect to each seed host, collect CDP/LLDP data, optionally recurse
-    into discovered neighbors, deduplicate, and return the full neighbor list.
+    Two-phase discovery:
 
-    When device_type is "auto" (default), each host is fingerprinted
-    individually before the main connection is made.
+    Phase 1 — Seeds:
+        Poll every seed host and collect their direct CDP/LLDP neighbors.
+
+    Phase 2 — One hop out:
+        For each neighbor discovered in phase 1, connect to that device
+        and run the same CDP/LLDP commands to reveal what is connected
+        beyond the seed's immediate view.
+
+    Discovery stops after this second hop. Devices already polled in
+    phase 1 are skipped in phase 2 to avoid redundant connections.
     """
     all_neighbors: list[Neighbor] = []
-    visited: set[str] = set()
-    queue: list[str] = list(seed_hosts)
-    # Cache detected types so recursive hops aren't re-probed unnecessarily
     type_cache: dict[str, str] = {}
 
-    while queue:
-        host = queue.pop(0)
-        if host in visited:
+    # ------------------------------------------------------------------
+    # Phase 1: seed devices
+    # ------------------------------------------------------------------
+    log.info("=== Phase 1: polling %d seed device(s) ===", len(seed_hosts))
+    polled: set[str] = set()          # tracks hostnames already queried
+    seed_neighbor_hosts: set[str] = set()  # IPs/hostnames to visit in phase 2
+
+    for host in seed_hosts:
+        hostname, neighbors = poll_device(
+            host, username, password, secret,
+            device_type, type_cache, use_cdp, use_lldp,
+        )
+        if hostname is None:
             continue
-        visited.add(host)
+        polled.add(hostname)
+        all_neighbors.extend(neighbors)
 
-        # Resolve device type — autodetect or use the fixed value supplied
-        if device_type == "auto":
-            if host not in type_cache:
-                type_cache[host] = autodetect_device_type(
-                    host, username, password, secret
-                )
-            resolved_type = type_cache[host]
-        else:
-            resolved_type = device_type
+        # Queue the neighbor device IDs for phase 2
+        for n in neighbors:
+            if n.neighbor_device not in polled:
+                seed_neighbor_hosts.add(n.neighbor_device)
 
-        device = build_device(host, username, password, secret, resolved_type)
-        conn = connect(device)
-        if conn is None:
+    # ------------------------------------------------------------------
+    # Phase 2: devices directly connected to the seeds
+    # ------------------------------------------------------------------
+    log.info(
+        "=== Phase 2: polling %d neighbor device(s) discovered from seeds ===",
+        len(seed_neighbor_hosts),
+    )
+    for host in seed_neighbor_hosts:
+        if host in polled:
+            log.info("  Skipping %s (already polled in phase 1)", host)
             continue
 
-        hostname = get_hostname(conn)
-        log.info("Discovered hostname: %s  (type: %s)", hostname, resolved_type)
+        hostname, neighbors = poll_device(
+            host, username, password, secret,
+            device_type, type_cache, use_cdp, use_lldp,
+        )
+        if hostname is None:
+            continue
+        polled.add(hostname)
+        all_neighbors.extend(neighbors)
 
-        batch: list[Neighbor] = []
-        if use_cdp:
-            batch.extend(get_cdp_neighbors(conn, hostname))
-        if use_lldp:
-            batch.extend(get_lldp_neighbors(conn, hostname))
-
-        conn.disconnect()
-        all_neighbors.extend(batch)
-
-        if recursive:
-            for n in batch:
-                if n.neighbor_device not in visited:
-                    queue.append(n.neighbor_device)
-
+    # ------------------------------------------------------------------
+    # Output
+    # ------------------------------------------------------------------
     unique = deduplicate(all_neighbors)
 
     print("\n=== Network Topology ===\n")
     print_table(unique)
 
-    diagram = generate_mermaid(unique)
-    print("\n=== Mermaid Diagram ===\n")
-    print(diagram)
-
     if csv_path:
         export_csv(unique, csv_path)
-
-    if mermaid_path:
-        save_mermaid(diagram, mermaid_path)
 
     return unique
 
@@ -521,8 +538,7 @@ def parse_args():
     p.add_argument("--no-cdp", dest="cdp",  action="store_false")
     p.add_argument("--recursive", "-r", action="store_true",
                    help="Recurse into discovered neighbors")
-    p.add_argument("--csv",     metavar="FILE", help="Export results to CSV")
-    p.add_argument("--mermaid", metavar="FILE", help="Save Mermaid diagram to file")
+    p.add_argument("--csv", metavar="FILE", help="Export results to CSV")
     return p.parse_args()
 
 
@@ -541,7 +557,5 @@ if __name__ == "__main__":
         use_cdp=args.cdp,
         use_lldp=args.lldp,
         csv_path=args.csv,
-        mermaid_path=args.mermaid,
         recursive=args.recursive,
     )
-
