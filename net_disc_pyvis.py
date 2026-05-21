@@ -555,85 +555,12 @@ def generate_pyvis(
         notebook=False,
     )
 
-    # Hierarchical layout options — passed as raw JSON to vis.js
-    net.set_options("""
-    {
-      "layout": {
-        "hierarchical": {
-          "enabled": true,
-          "direction": "UD",
-          "sortMethod": "directed",
-          "levelSeparation": 160,
-          "nodeSpacing": 140,
-          "treeSpacing": 200,
-          "blockShifting": true,
-          "edgeMinimization": true,
-          "parentCentralization": true
-        }
-      },
-      "physics": {
-        "enabled": true,
-        "hierarchicalRepulsion": {
-          "nodeDistance": 160,
-          "springLength": 120,
-          "springConstant": 0.01,
-          "damping": 0.09,
-          "avoidOverlap": 1
-        },
-        "solver": "hierarchicalRepulsion",
-        "stabilization": {
-          "enabled": true,
-          "iterations": 200
-        }
-      },
-      "edges": {
-        "smooth": {
-          "type": "cubicBezier",
-          "forceDirection": "vertical",
-          "roundness": 0.4
-        },
-        "font": {
-          "size": 9,
-          "color": "#7fb3d3",
-          "align": "middle",
-          "strokeWidth": 0
-        },
-        "color": {
-          "color": "#4a90d9",
-          "highlight": "#ffffff",
-          "hover": "#aad4f5"
-        },
-        "width": 2,
-        "selectionWidth": 3
-      },
-      "nodes": {
-        "font": {
-          "size": 12,
-          "color": "#ecf0f1",
-          "face": "monospace"
-        },
-        "shadow": {
-          "enabled": true,
-          "color": "rgba(0,0,0,0.5)",
-          "size": 8,
-          "x": 3,
-          "y": 3
-        }
-      },
-      "interaction": {
-        "hover": true,
-        "tooltipDelay": 100,
-        "navigationButtons": true,
-        "keyboard": true
-      }
-    }
-    """)
 
     # Collect metadata for tooltips — track connections per device too
     node_meta:  dict[str, dict] = {}
     node_conns: dict[str, list] = {}
     for n in neighbors:
-        node_meta.setdefault(n.local_device,   {"ip": "",          "platform": ""})
+        node_meta.setdefault(n.local_device,    {"ip": "",            "platform": ""})
         node_meta.setdefault(n.neighbor_device, {"ip": n.neighbor_ip, "platform": n.platform})
         node_conns.setdefault(n.local_device,   []).append(f"{n.local_interface} → {n.neighbor_device}")
         node_conns.setdefault(n.neighbor_device,[]).append(f"{n.neighbor_interface} → {n.local_device}")
@@ -645,9 +572,9 @@ def generate_pyvis(
             if device in added:
                 continue
 
-            group  = _get_group(device)
-            meta   = node_meta.get(device, {})
-            conns  = node_conns.get(device, [])
+            group     = _get_group(device)
+            meta      = node_meta.get(device, {})
+            conns     = node_conns.get(device, [])
             conn_html = "".join(f"<br>&nbsp;&nbsp;• {c}" for c in conns)
             tip = (
                 f"<b>{device}</b><br>"
@@ -676,8 +603,52 @@ def generate_pyvis(
             title=f"{n.protocol}: {edge_label}",
         )
 
-    net.show_buttons(filter_=["layout", "physics"])
+    # Generate base HTML — avoid set_options()/options API which triggers
+    # AttributeError on many pyvis versions. Instead inject vis.js options
+    # directly into the generated HTML after the fact.
     net.write_html(output_file)
+
+    vis_options = """
+    network.setOptions({
+      layout: {
+        hierarchical: {
+          enabled: true, direction: "UD", sortMethod: "directed",
+          levelSeparation: 160, nodeSpacing: 140, treeSpacing: 200,
+          blockShifting: true, edgeMinimization: true, parentCentralization: true
+        }
+      },
+      physics: {
+        solver: "hierarchicalRepulsion",
+        hierarchicalRepulsion: {
+          nodeDistance: 160, springLength: 120, springConstant: 0.01,
+          damping: 0.09, avoidOverlap: 1
+        },
+        stabilization: { enabled: true, iterations: 200 }
+      },
+      edges: {
+        smooth: { type: "cubicBezier", forceDirection: "vertical", roundness: 0.4 },
+        font:   { size: 9, color: "#7fb3d3", align: "middle", strokeWidth: 0 },
+        color:  { color: "#4a90d9", highlight: "#ffffff", hover: "#aad4f5" },
+        width: 2, selectionWidth: 3
+      },
+      nodes: {
+        font:   { size: 12, color: "#ecf0f1", face: "monospace" },
+        shadow: { enabled: true, color: "rgba(0,0,0,0.5)", size: 8, x: 3, y: 3 }
+      },
+      interaction: {
+        hover: true, tooltipDelay: 100,
+        navigationButtons: true, keyboard: true
+      }
+    });
+    """
+
+    with open(output_file, "r") as f:
+        html = f.read()
+    # Inject setOptions() call just before the first </script> closing tag,
+    # which appears after the network instantiation block in pyvis output
+    html = html.replace("</script>", f"{vis_options}\n</script>", 1)
+    with open(output_file, "w") as f:
+        f.write(html)
 
     log.info("Topology diagram saved → %s", output_file)
     if auto_open:
