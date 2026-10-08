@@ -28,6 +28,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+try:
+    import readline  # noqa: F401 - gives input() proper backspace/arrow editing
+except ImportError:  # not available on Windows
+    pass
+
 from netmiko import ConnectHandler, SSHDetect
 from netmiko.exceptions import (
     NetmikoAuthenticationException,
@@ -72,6 +77,12 @@ class Match:
     @property
     def section(self) -> str:
         return " > ".join(p.strip() for p in self.parents) or "(global)"
+
+    def full_config(self, use_new: bool) -> str:
+        """Parent hierarchy plus the matched line, original indentation kept,
+        as a multi-line block (one CSV cell)."""
+        line = self.new_line if use_new else self.old_line
+        return "\n".join([*(p.rstrip() for p in self.parents), line.rstrip()])
 
 
 # --------------------------------------------------------------------------- #
@@ -355,8 +366,13 @@ def main():
     password = getpass.getpass("Password        : ")
 
     pattern = build_pattern(old_name)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    outdir = Path(f"rename_{safe_name(old_name)}_to_{safe_name(new_name)}_{stamp}")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    base_dir = f"{safe_name(old_name)}_to_{safe_name(new_name)}_{stamp}"
+    outdir = Path(base_dir)
+    n = 2
+    while outdir.exists():          # second run in the same minute
+        outdir = Path(f"{base_dir}_{n}")
+        n += 1
     outdir.mkdir()
 
     # ---- seed -----------------------------------------------------------
@@ -414,13 +430,16 @@ def main():
     with report.open("w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["device", "ip", "os", "line", "section",
-                    "current", "new", "status", "note"])
+                    "current", "new", "current_config", "new_config",
+                    "status", "note"])
         for m in sorted(all_matches, key=lambda x: (x.device, x.line_no)):
             w.writerow([m.device, m.ip, m.os_type, m.line_no, m.section,
                         m.old_line.strip(), m.new_line.strip(),
+                        m.full_config(use_new=False),
+                        m.full_config(use_new=True),
                         m.status, m.note])
         for name, ip, err in errors:
-            w.writerow([name, ip, "", "", "", "", "", "ERROR", err])
+            w.writerow([name, ip, "", "", "", "", "", "", "", "ERROR", err])
 
     print(f"\n{len(all_matches)} instance(s) found. Output in ./{outdir}/")
     print("  *_apply.txt     safe changes, ready to paste (NOT applied)")

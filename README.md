@@ -64,7 +64,7 @@ Connecting to seed 192.168.0.1 ...
   LEAF1                          192.168.0.11     cisco_nxos  OK=3 CHECK=1 REVIEW=1
   ACC1                           192.168.0.21     cisco_ios   OK=1 CHECK=0 REVIEW=1
 
-7 instance(s) found. Output in ./rename_CORE-SW01_to_DC1-CORE-01_20261006_171500/
+7 instance(s) found. Output in ./CORE-SW01_to_DC1-CORE-01_20261006_1715/
 ```
 
 ## What it does
@@ -92,14 +92,16 @@ Connecting to seed 192.168.0.1 ...
 ## Output
 
 Each run creates a timestamped folder:
-`rename_<old>_to_<new>_<YYYYMMDD_HHMMSS>/`
+`<old>_to_<new>_<YYYYMMDD_HHMM>/`
+
+If you run it twice in the same minute, the second folder gets `_2` added.
 
 | File | Contents |
 |---|---|
 | `<device>_apply.txt` | OK changes with their parent hierarchy, wrapped in `configure terminal` ... `end`. IOS-XR files also include `commit`. |
 | `<device>_rollback.txt` | The same changes with the old names, to reverse `_apply.txt`. |
 | `<device>_review.txt` | CHECK and REVIEW items, each with section, current line, proposed line and a note. |
-| `report.csv` | Every instance found, plus any devices that could not be reached. |
+| `report.csv` | Every instance found, plus any devices that could not be reached. Includes `current_config` and `new_config` columns holding the full block being changed (parent hierarchy plus the line) as a multi-line cell. |
 | `backups/<device>_running.cfg` | The running config captured from each neighbour. |
 
 Example `report.csv` rows:
@@ -110,6 +112,16 @@ Example `report.csv` rows:
 | OK | router bgp 65001 > vrf PROD > neighbor 10.1.0.1 | description CORE-SW01 PROD | description DC1-CORE-01 PROD |
 | CHECK | (global) | ip host CORE-SW01 10.0.0.1 | ip host DC1-CORE-01 10.0.0.1 |
 | REVIEW | (global) | route-map TO-CORE-SW01 permit 10 | route-map TO-DC1-CORE-01 permit 10 |
+
+Example `current_config` / `new_config` cells for the VRF row:
+
+```
+current_config                      new_config
+router bgp 65001                    router bgp 65001
+  vrf PROD                            vrf PROD
+    neighbor 10.1.0.1                   neighbor 10.1.0.1
+      description CORE-SW01 PROD          description DC1-CORE-01 PROD
+```
 
 Example `_apply.txt` (NX-OS):
 
@@ -144,7 +156,7 @@ end
   Add this to the repository's `.gitignore`:
 
   ```
-  rename_*/
+  *_to_*_????????_????*/
   ```
 
 ## Limitations
