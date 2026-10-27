@@ -1,3 +1,4 @@
+[README (1).md](https://github.com/user-attachments/files/34027527/README.1.md)
 # switch_rename_prep.py
 
 Prepares the configuration changes needed on neighbouring devices when a
@@ -95,14 +96,20 @@ If the old name appears in a banner (`motd`, `login`, `exec` and so on), the
 whole banner is rebuilt as one paste-ready block. Re-entering `banner <type>`
 replaces the existing banner, so this is safe to apply.
 
-- The `^C` delimiter from `show running-config` (including forms such as
-  `banner motd ^CCC` and the raw ETX character) is replaced with the first of
-  `# % @ ~ | $ & *` that does not appear in the banner text, because a typed
-  `^C` is not treated as a delimiter when pasted.
-- Any characters after `^C` on the first line (the `CC` in `^CCC`) are kept as
-  banner text, as that is how the device stores them.
-- If the banner text contains every one of those characters, it is listed as
-  REVIEW instead.
+- `banner motd ^CCC` means different things by platform, and both are
+  handled:
+  - IOS / IOS-XE / XR: `^C` is the delimiter, the banner ends at `^C`.
+  - NX-OS: `^` is the delimiter, the banner ends at a bare `^`.
+  The script tries the platform's own reading first, then the other.
+- The delimiter is replaced with the first of `# % @ ~ | $ & *` not in the
+  banner text, because a typed `^C` does not work as a delimiter when pasted.
+- Characters after the delimiter on the first line (the `CC`/`CCC` in
+  `^CCC`) are kept as banner text, as that is what the device holds. Delete
+  that line from the new banner if you do not want it.
+- If the end of a banner cannot be found within 60 lines, the banner is
+  listed as REVIEW and the rest of the config is still checked normally.
+- If the banner text contains every candidate delimiter, it is listed as
+  REVIEW.
 
 ## Output
 
