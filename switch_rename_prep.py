@@ -201,38 +201,78 @@ def classify(m: Match, has_children: bool, pattern):
               "removing with 'no'.")
 
 
+# 'banner motd ^C...', 'banner motd ^CCC', 'banner motd <ETX>', 'banner motd #'
+BANNER_RE = re.compile(r"^banner\s+(\S+)\s+(\^C|\x03|\S)(.*)$")
+# Delimiters to use in the generated banner, first one not in the text wins
+BANNER_DELIMS = "#%@~|$&*"
+
+
+def parse_banner(lines, start):
+    """Parse a banner starting at lines[start]. Returns
+    (kind, text_lines, end_index) or None if the line is not a banner."""
+    bm = BANNER_RE.match(lines[start].rstrip())
+    if not bm:
+        return None
+    kind, delim, rest = bm.groups()
+    # On IOS '^C' and ETX (0x03) are the same delimiter as displayed
+    closers = ("^C", "\x03") if delim in ("^C", "\x03") else (delim,)
+
+    def split_close(text):
+        pos = [text.find(c) for c in closers if c in text]
+        return (text[:min(pos)], True) if pos else (text, False)
+
+    head, closed = split_close(rest)
+    text = [head] if head.strip() else []
+    i = start
+    while not closed and i + 1 < len(lines):
+        i += 1
+        part, closed = split_close(lines[i].rstrip("\r\n"))
+        if part or not closed:
+            text.append(part)
+    return kind, text, i
+
+
+def banner_block(kind, text_lines):
+    """Rebuild a banner as paste-ready config with a safe delimiter."""
+    body = "\n".join(text_lines)
+    delim = next((d for d in BANNER_DELIMS if d not in body), None)
+    if delim is None:
+        return None, None
+    return f"banner {kind} {delim}\n{body}\n{delim}", delim
+
+
 def find_matches(config, pattern, new_name, device, ip, os_type) -> list:
     lines = config.splitlines()
     results = []
     stack = []                 # [(indent, line)] - current parent chain
-    banner_delim = None
-    banner_head = None
+    idx = -1
 
-    for idx, raw in enumerate(lines):
-        line = raw.rstrip()
+    while idx + 1 < len(lines):
+        idx += 1
+        line = lines[idx].rstrip()
 
-        # ---- inside a multi-line banner -------------------------------
-        if banner_delim:
-            if pattern.search(line):
-                m = Match(device, ip, os_type, idx + 1, [banner_head], line,
-                          pattern.sub(new_name, line), "REVIEW",
-                          "Banner text - the whole banner must be re-entered.")
-                results.append(m)
-            if banner_delim in line:
-                banner_delim = None
-            continue
-
-        bm = re.match(r"^banner\s+\S+\s+(\^C|\S)(.*)$", line)
-        if bm:
-            delim, rest = bm.group(1), bm.group(2)
-            if pattern.search(line):
-                results.append(Match(
-                    device, ip, os_type, idx + 1, [], line,
-                    pattern.sub(new_name, line), "REVIEW",
-                    "Banner text - the whole banner must be re-entered."))
-            if delim not in rest:
-                banner_delim, banner_head = delim, line
+        # ---- banners: rewrite the whole banner as one block ------------
+        banner = parse_banner(lines, idx)
+        if banner:
+            kind, text, end = banner
+            if any(pattern.search(t) for t in text):
+                new_text = [pattern.sub(new_name, t) for t in text]
+                old_blk, d1 = banner_block(kind, text)
+                new_blk, d2 = banner_block(kind, new_text)
+                if old_blk and new_blk:
+                    results.append(Match(
+                        device, ip, os_type, idx + 1, [], old_blk, new_blk,
+                        "OK",
+                        f"Whole banner re-entered (replaces the existing "
+                        f"banner {kind}). Delimiter shown as '{d2}'."))
+                else:
+                    results.append(Match(
+                        device, ip, os_type, idx + 1, [], line,
+                        pattern.sub(new_name, line), "REVIEW",
+                        "Banner text uses every candidate delimiter - "
+                        "rebuild this banner by hand."))
             stack = []
+            idx = end
             continue
 
         if _is_noise(line):
@@ -304,6 +344,31 @@ def review_text(matches) -> str:
             f"  Note    : {m.note}",
             "",
         ]
+    return "\n".join(out)
+
+
+def paste_report(matches, errors) -> str:
+    """Plain-text report grouped by device. Each change shows the full
+    current block and the full new block, ready to copy and paste."""
+    out = []
+    by_dev = OrderedDict()
+    for m in sorted(matches, key=lambda x: (x.device, x.line_no)):
+        by_dev.setdefault(m.device, []).append(m)
+
+    for dev, items in by_dev.items():
+        first = items[0]
+        out += ["=" * 70, f"{dev}  ({first.ip}, {first.os_type})", "=" * 70, ""]
+        for m in items:
+            out.append(f"[{m.status}] line {m.line_no} - {m.section}")
+            if m.status != "OK":
+                out.append(f"NOTE: {m.note}")
+            out += ["", "--- Current ---", m.full_config(use_new=False), "",
+                    "--- New ---", m.full_config(use_new=True), "", ""]
+
+    if errors:
+        out += ["=" * 70, "UNREACHABLE", "=" * 70]
+        out += [f"{name} ({ip}): {err}" for name, ip, err in errors]
+        out.append("")
     return "\n".join(out)
 
 
@@ -429,22 +494,30 @@ def main():
     report = outdir / "report.csv"
     with report.open("w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["device", "ip", "os", "line", "section",
-                    "current", "new", "current_config", "new_config",
-                    "status", "note"])
+        # One config line per row so cells copy out of Excel without quotes.
+        # Rows of the same change share a 'change' number; device and status
+        # repeat on every row so filtering keeps whole blocks together.
+        w.writerow(["device", "ip", "os", "change", "line", "section",
+                    "current_config", "new_config", "status", "note"])
+        change = 0
         for m in sorted(all_matches, key=lambda x: (x.device, x.line_no)):
-            w.writerow([m.device, m.ip, m.os_type, m.line_no, m.section,
-                        m.old_line.strip(), m.new_line.strip(),
-                        m.full_config(use_new=False),
-                        m.full_config(use_new=True),
-                        m.status, m.note])
+            change += 1
+            cur = m.full_config(use_new=False).split("\n")
+            new = m.full_config(use_new=True).split("\n")
+            for i, (c, n) in enumerate(zip(cur, new)):
+                w.writerow([m.device, m.ip, m.os_type, change, m.line_no,
+                            m.section, c, n, m.status,
+                            m.note if i == 0 else ""])
         for name, ip, err in errors:
-            w.writerow([name, ip, "", "", "", "", "", "", "", "ERROR", err])
+            w.writerow([name, ip, "", "", "", "", "", "", "ERROR", err])
+
+    (outdir / "report.txt").write_text(paste_report(all_matches, errors))
 
     print(f"\n{len(all_matches)} instance(s) found. Output in ./{outdir}/")
     print("  *_apply.txt     safe changes, ready to paste (NOT applied)")
     print("  *_rollback.txt  reverses *_apply.txt")
     print("  *_review.txt    items needing a manual decision")
+    print("  report.txt      current vs new config blocks, ready to copy")
     print("  report.csv      every instance found")
     print("  backups/        running configs captured")
 
