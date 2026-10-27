@@ -85,9 +85,24 @@ Connecting to seed 192.168.0.1 ...
 
 | Status | Meaning | Where it goes |
 |---|---|---|
-| OK | Name is in free text (`description`, `remark`). Re-entering the line overwrites the old value. | `_apply.txt` |
+| OK | Name is in free text (`description`, `remark`) or a banner. Re-entering overwrites the old value. Banners are rebuilt in full (see below). | `_apply.txt` |
 | CHECK | Name is a command argument, e.g. `ip host CORE-SW01 10.0.0.1`. Re-entering may add a second entry, so the old line may need removing with `no`. | `_review.txt` |
-| REVIEW | Name is in a section header (route-map, prefix-list, VRF name) or a banner. Renaming creates a new object, so references and the old section need manual handling. | `_review.txt` |
+| REVIEW | Name is in a section header (route-map, prefix-list, VRF name). Renaming creates a new object, so references and the old section need manual handling. | `_review.txt` |
+
+### Banners
+
+If the old name appears in a banner (`motd`, `login`, `exec` and so on), the
+whole banner is rebuilt as one paste-ready block. Re-entering `banner <type>`
+replaces the existing banner, so this is safe to apply.
+
+- The `^C` delimiter from `show running-config` (including forms such as
+  `banner motd ^CCC` and the raw ETX character) is replaced with the first of
+  `# % @ ~ | $ & *` that does not appear in the banner text, because a typed
+  `^C` is not treated as a delimiter when pasted.
+- Any characters after `^C` on the first line (the `CC` in `^CCC`) are kept as
+  banner text, as that is how the device stores them.
+- If the banner text contains every one of those characters, it is listed as
+  REVIEW instead.
 
 ## Output
 
@@ -101,27 +116,39 @@ If you run it twice in the same minute, the second folder gets `_2` added.
 | `<device>_apply.txt` | OK changes with their parent hierarchy, wrapped in `configure terminal` ... `end`. IOS-XR files also include `commit`. |
 | `<device>_rollback.txt` | The same changes with the old names, to reverse `_apply.txt`. |
 | `<device>_review.txt` | CHECK and REVIEW items, each with section, current line, proposed line and a note. |
-| `report.csv` | Every instance found, plus any devices that could not be reached. Includes `current_config` and `new_config` columns holding the full block being changed (parent hierarchy plus the line) as a multi-line cell. |
+| `report.txt` | Plain-text report grouped by device. Each change shows the full current block and the full new block, ready to copy and paste. CHECK and REVIEW items include their note. |
+| `report.csv` | Every instance found, plus any devices that could not be reached. One config line per row: each change is split across rows (parent lines, then the changed line) in the `current_config` and `new_config` columns, with a shared `change` number. Select those cells in Excel and copy to get paste-ready config. |
 | `backups/<device>_running.cfg` | The running config captured from each neighbour. |
 
-Example `report.csv` rows:
-
-| status | section | current | new |
-|---|---|---|---|
-| OK | interface Ethernet1/49 | description to-core-sw01:Eth1/1 | description to-DC1-CORE-01:Eth1/1 |
-| OK | router bgp 65001 > vrf PROD > neighbor 10.1.0.1 | description CORE-SW01 PROD | description DC1-CORE-01 PROD |
-| CHECK | (global) | ip host CORE-SW01 10.0.0.1 | ip host DC1-CORE-01 10.0.0.1 |
-| REVIEW | (global) | route-map TO-CORE-SW01 permit 10 | route-map TO-DC1-CORE-01 permit 10 |
-
-Example `current_config` / `new_config` cells for the VRF row:
+Example `report.txt` entry:
 
 ```
-current_config                      new_config
-router bgp 65001                    router bgp 65001
-  vrf PROD                            vrf PROD
-    neighbor 10.1.0.1                   neighbor 10.1.0.1
-      description CORE-SW01 PROD          description DC1-CORE-01 PROD
+[OK] line 2 - interface Ethernet1/49
+
+--- Current ---
+interface Ethernet1/49
+  description to-core-sw01:Eth1/1
+
+--- New ---
+interface Ethernet1/49
+  description to-DC1-CORE-01:Eth1/1
 ```
+
+Example `report.csv` rows (columns ip, os and note omitted here):
+
+| device | change | line | section | current_config | new_config | status |
+|---|---|---|---|---|---|---|
+| LEAF1 | 1 | 2 | interface Ethernet1/49 | interface Ethernet1/49 | interface Ethernet1/49 | OK |
+| LEAF1 | 1 | 2 | interface Ethernet1/49 | &nbsp;&nbsp;description to-core-sw01:Eth1/1 | &nbsp;&nbsp;description to-DC1-CORE-01:Eth1/1 | OK |
+| LEAF1 | 2 | 6 | router bgp 65001 > vrf PROD > neighbor 10.1.0.1 | router bgp 65001 | router bgp 65001 | OK |
+| LEAF1 | 2 | 6 | router bgp 65001 > vrf PROD > neighbor 10.1.0.1 | &nbsp;&nbsp;vrf PROD | &nbsp;&nbsp;vrf PROD | OK |
+| LEAF1 | 2 | 6 | router bgp 65001 > vrf PROD > neighbor 10.1.0.1 | &nbsp;&nbsp;&nbsp;&nbsp;neighbor 10.1.0.1 | &nbsp;&nbsp;&nbsp;&nbsp;neighbor 10.1.0.1 | OK |
+| LEAF1 | 2 | 6 | router bgp 65001 > vrf PROD > neighbor 10.1.0.1 | &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;description CORE-SW01 PROD | &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;description DC1-CORE-01 PROD | OK |
+| LEAF1 | 3 | 7 | (global) | ip host CORE-SW01 10.0.0.1 | ip host DC1-CORE-01 10.0.0.1 | CHECK |
+
+The device, section and status repeat on every row, so filtering by device or
+status keeps each block whole. The note is only on the first row of each
+change.
 
 Example `_apply.txt` (NX-OS):
 
