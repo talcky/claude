@@ -201,22 +201,16 @@ def classify(m: Match, has_children: bool, pattern):
               "removing with 'no'.")
 
 
-# 'banner motd ^C...', 'banner motd ^CCC', 'banner motd <ETX>', 'banner motd #'
-BANNER_RE = re.compile(r"^banner\s+(\S+)\s+(\^C|\x03|\S)(.*)$")
 # Delimiters to use in the generated banner, first one not in the text wins
 BANNER_DELIMS = "#%@~|$&*"
 
 
-def parse_banner(lines, start):
-    """Parse a banner starting at lines[start]. Returns
-    (kind, text_lines, end_index) or None if the line is not a banner."""
-    bm = BANNER_RE.match(lines[start].rstrip())
-    if not bm:
-        return None
-    kind, delim, rest = bm.groups()
-    # On IOS '^C' and ETX (0x03) are the same delimiter as displayed
-    closers = ("^C", "\x03") if delim in ("^C", "\x03") else (delim,)
+BANNER_MAX_LINES = 60   # a banner longer than this is treated as unparsed
 
+
+def _scan_banner(lines, start, rest, closers):
+    """Collect banner text until a line contains one of 'closers'.
+    Returns (text_lines, end_index) or None if no close was found in time."""
     def split_close(text):
         pos = [text.find(c) for c in closers if c in text]
         return (text[:min(pos)], True) if pos else (text, False)
@@ -224,12 +218,47 @@ def parse_banner(lines, start):
     head, closed = split_close(rest)
     text = [head] if head.strip() else []
     i = start
-    while not closed and i + 1 < len(lines):
+    while not closed:
         i += 1
+        if i >= len(lines) or i - start > BANNER_MAX_LINES:
+            return None
         part, closed = split_close(lines[i].rstrip("\r\n"))
         if part or not closed:
             text.append(part)
-    return kind, text, i
+    return text, i
+
+
+def parse_banner(lines, start, os_type=""):
+    """Parse a banner starting at lines[start].
+    Returns (kind, text_lines, end_index), 'UNCLOSED' if it looks like a
+    banner but no end was found, or None if the line is not a banner.
+
+    The same 'banner motd ^CCC' header means different things:
+      IOS/IOS-XE/XR: '^C' is the displayed delimiter, 'CC' is text, ends at ^C
+      NX-OS        : '^' is the literal delimiter, 'CCC' is text, ends at ^
+    Both readings are tried (platform's own first) and the first that closes
+    within BANNER_MAX_LINES wins, so a banner can never swallow the config."""
+    bm = re.match(r"^banner\s+(\S+)\s+(.*)$", lines[start].rstrip())
+    if not bm:
+        return None
+    kind, tail = bm.groups()
+    if not tail:
+        return None
+
+    readings = []
+    if tail.startswith("^C") or tail.startswith("\x03"):
+        cut = 1 if tail.startswith("\x03") else 2
+        readings.append(("ios", tail[cut:], ("^C", "\x03")))
+    readings.append(("literal", tail[1:], (tail[0],)))
+    if os_type == "cisco_nxos":
+        readings.sort(key=lambda r: r[0] != "literal")
+
+    for _, rest, closers in readings:
+        found = _scan_banner(lines, start, rest, closers)
+        if found:
+            text, end = found
+            return kind, text, end
+    return "UNCLOSED"
 
 
 def banner_block(kind, text_lines):
@@ -252,7 +281,15 @@ def find_matches(config, pattern, new_name, device, ip, os_type) -> list:
         line = lines[idx].rstrip()
 
         # ---- banners: rewrite the whole banner as one block ------------
-        banner = parse_banner(lines, idx)
+        banner = parse_banner(lines, idx, os_type)
+        if banner == "UNCLOSED":
+            # Could not find the end - report it and parse the rest normally
+            results.append(Match(
+                device, ip, os_type, idx + 1, [], line, line, "REVIEW",
+                "Could not find the end of this banner - check it by hand. "
+                "The rest of the config was still checked."))
+            stack = []
+            continue
         if banner:
             kind, text, end = banner
             if any(pattern.search(t) for t in text):
